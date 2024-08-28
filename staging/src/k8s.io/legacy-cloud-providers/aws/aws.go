@@ -251,6 +251,11 @@ const volumeAttachmentStuck = "VolumeAttachmentStuck"
 // Indicates that a node has volumes stuck in attaching state and hence it is not fit for scheduling more pods
 const nodeWithImpairedVolumes = "NodeWithImpairedVolumes"
 
+// Headers for STS request for source ARN
+const headerSourceArn = "x-amz-source-arn"
+// Headers for STS request for source account
+const headerSourceAccount = "x-amz-source-account"
+
 const (
 	// volumeAttachmentConsecutiveErrorLimit is the number of consecutive errors we will ignore when waiting for a volume to attach/detach
 	volumeAttachmentStatusConsecutiveErrorLimit = 10
@@ -604,6 +609,11 @@ type CloudConfig struct {
 
 		// RoleARN is the IAM role to assume when interaction with AWS APIs.
 		RoleARN string
+		// SourceARN is value which is passed while assuming role specified by RoleARN. When a service
+		// assumes a role in your account, you can include the aws:SourceAccount and aws:SourceArn global
+		// condition context keys in your role trust policy to limit access to the role to only requests that are generated
+		// by expected resources. https://docs.aws.amazon.com/IAM/latest/UserGuide/confused-deputy.html
+		SourceARN string
 
 		// KubernetesClusterTag is the legacy cluster id we'll use to identify our cluster resources
 		KubernetesClusterTag string
@@ -1201,8 +1211,13 @@ func init() {
 		var creds *credentials.Credentials
 		if cfg.Global.RoleARN != "" {
 			klog.Infof("Using AWS assumed role %v", cfg.Global.RoleARN)
+
+			stsClient, err := getSTSClient(sess, cfg.Global.SourceARN)
+			if err != nil {
+				return nil, fmt.Errorf("unable to create sts client, %v", err)
+			}
 			provider := &stscreds.AssumeRoleProvider{
-				Client:  sts.New(sess),
+				Client:  stsClient,
 				RoleARN: cfg.Global.RoleARN,
 			}
 
@@ -1218,13 +1233,60 @@ func init() {
 	})
 }
 
+func getSTSClient(sess *session.Session, sourceARN string) (*sts.STS, error) {
+	stsClient := sts.New(sess)
+
+	// parse both source account and source arn from the sourceARN, and add them as headers to the STS client
+	if sourceARN != "" {
+		sourceAcct, err := getSourceAccount(sourceARN)
+		if err != nil {
+			return nil, err
+		}
+		reqHeaders := map[string]string{
+			headerSourceAccount: sourceAcct,
+			headerSourceArn:     sourceARN,
+		}
+		stsClient.Handlers.Sign.PushFront(func(s *request.Request) {
+			s.ApplyOptions(request.WithSetRequestHeaders(reqHeaders))
+		})
+		klog.V(4).Infof("configuring STS client with extra headers, %v", reqHeaders)
+	}
+	return stsClient, nil
+}
+
+func getRegionFromMetadata(cfg *CloudConfig) (string, error) {
+	klog.Infof("Get AWS region from metadata client")
+
+	metadata, err := newAWSSDKProvider(nil, cfg).Metadata()
+	if err != nil {
+		return "", fmt.Errorf("error creating AWS metadata client: %q", err)
+	}
+
+	err = updateConfigZone(cfg, metadata)
+	if err != nil {
+		return "", fmt.Errorf("unable to determine AWS zone from cloud provider config or EC2 instance metadata: %v", err)
+	}
+
+	zone := cfg.Global.Zone
+	if len(zone) <= 1 {
+		return "", fmt.Errorf("invalid AWS zone in config file: %s", zone)
+	}
+
+	regionName, err := azToRegion(zone)
+	if err != nil {
+		return "", err
+	}
+
+	return regionName, nil
+}
+
 // readAWSCloudConfig reads an instance of AWSCloudConfig from config reader.
 func readAWSCloudConfig(config io.Reader) (*CloudConfig, error) {
 	var cfg CloudConfig
 	var err error
 
 	if config != nil {
-		err = gcfg.ReadInto(&cfg, config)
+		err = gcfg.FatalOnly(gcfg.ReadInto(&cfg, config))
 		if err != nil {
 			return nil, err
 		}
