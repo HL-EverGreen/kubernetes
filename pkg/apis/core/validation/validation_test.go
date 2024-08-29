@@ -17248,6 +17248,17 @@ func TestValidateEndpointsCreate(t *testing.T) {
 				},
 			},
 		},
+		"special endpoint object with loopback address": {
+			endpoints: core.Endpoints{
+				ObjectMeta: metav1.ObjectMeta{Name: "eks-extension-metrics-api", Namespace: "kube-system"},
+				Subsets: []core.EndpointSubset{
+					{
+						Addresses: []core.EndpointAddress{{IP: "127.0.0.1"}},
+						Ports:     []core.EndpointPort{{Name: "p", Port: 93, Protocol: "TCP"}},
+					},
+				},
+			},
+		},
 	}
 
 	for name, tc := range successCases {
